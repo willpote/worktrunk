@@ -1813,6 +1813,60 @@ fn test_remove_detached_worktree_in_multi(mut repo: TestRepo) {
     ));
 }
 
+/// Reproduces #1661: "(detached)" is not a valid branch name — verify it fails.
+#[rstest]
+fn test_remove_detached_by_name_fails(mut repo: TestRepo) {
+    repo.add_worktree("feature-detached");
+    repo.detach_head_in_worktree("feature-detached");
+
+    // "(detached)" is not a branch name — this should fail
+    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &["(detached)"], None));
+}
+
+/// Verify that detached worktrees can be removed by absolute path (#1661).
+/// This ensures the CLI supports the same operation the picker uses.
+#[rstest]
+fn test_remove_detached_worktree_by_path(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("feature-detached");
+    repo.detach_head_in_worktree("feature-detached");
+
+    assert!(worktree_path.exists());
+
+    let worktree_str = worktree_path.to_string_lossy().to_string();
+    let output = repo
+        .wt_command()
+        .args(["remove", &worktree_str, "--foreground", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "wt remove should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !worktree_path.exists(),
+        "Worktree directory should be removed"
+    );
+}
+
+/// Verify that detached worktrees can be removed by relative path.
+/// This tests resolve_worktree_arg's CWD-relative path resolution for Remove context.
+#[rstest]
+fn test_remove_detached_worktree_by_relative_path(mut repo: TestRepo) {
+    repo.add_worktree("feature-detached");
+    repo.detach_head_in_worktree("feature-detached");
+
+    // From the main worktree (repo/), the relative path resolves against CWD
+    let relative_path = "../repo.feature-detached";
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &[relative_path, "--foreground", "--yes"],
+        None,
+    ));
+}
+
 /// Test that resolve_worktree("@") works when the worktree is accessed via a symlink.
 ///
 /// This tests the path normalization fix where:
