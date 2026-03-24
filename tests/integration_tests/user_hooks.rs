@@ -2172,3 +2172,63 @@ check = "test -d {{ cwd }} && echo 'cwd_exists=true' > ../cwd_check.txt || echo 
         "cwd should point to an existing directory, got: {content}"
     );
 }
+
+// ============================================================================
+// Wait Flag Tests
+// ============================================================================
+
+#[rstest]
+fn test_user_post_start_wait_runs_before_background(repo: TestRepo) {
+    // Wait command creates a marker file; background command reads it.
+    // If wait runs first, the background command finds the marker.
+    repo.write_test_config(
+        r#"[post-start]
+setup = { run = "echo SETUP_DONE > wait_marker.txt", wait = true }
+bg = "cat wait_marker.txt > bg_saw_marker.txt"
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_start_wait_before_bg",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let bg_file = worktree_path.join("bg_saw_marker.txt");
+    wait_for_file_content(&bg_file);
+
+    let content = fs::read_to_string(&bg_file).unwrap();
+    assert!(
+        content.contains("SETUP_DONE"),
+        "Background command should see wait command's output, got: {content}"
+    );
+}
+
+#[rstest]
+fn test_user_post_start_wait_failure_skips_same_type(repo: TestRepo) {
+    // A failing wait command should prevent background commands of the same
+    // hook type from running, but not block other hook types.
+    repo.write_test_config(
+        r#"[post-start]
+fail = { run = "exit 1", wait = true }
+bg = "echo SHOULD_NOT_RUN > should_not_exist.txt"
+"#,
+    );
+
+    snapshot_switch(
+        "user_post_start_wait_failure",
+        &repo,
+        &["--create", "feature"],
+    );
+
+    // Give background commands time to run (if they were going to)
+    std::thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+
+    let worktree_path = repo.root_path().parent().unwrap().join("repo.feature");
+    let marker_file = worktree_path.join("should_not_exist.txt");
+    assert!(
+        !marker_file.exists(),
+        "Background command should NOT run after wait command failure"
+    );
+}
