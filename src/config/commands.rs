@@ -17,6 +17,9 @@ pub struct Command {
     pub template: String,
     /// Expanded command with variables substituted (same as template if not expanded yet)
     pub expanded: String,
+    /// When true, this command runs serially (blocking) before concurrent commands are
+    /// spawned. Only meaningful for post-* hooks; ignored for pre-* hooks (already serial).
+    pub wait: bool,
 }
 
 impl Command {
@@ -26,6 +29,7 @@ impl Command {
             name,
             expanded: template.clone(),
             template,
+            wait: false,
         }
     }
 
@@ -35,6 +39,7 @@ impl Command {
             name,
             template,
             expanded,
+            wait: false,
         }
     }
 }
@@ -78,18 +83,46 @@ impl<'de> Deserialize<'de> for CommandConfig {
     where
         D: serde::Deserializer<'de>,
     {
+        /// A single command value: either a plain string or `{ run = "...", wait = true }`.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum CommandValue {
+            Simple(String),
+            Extended {
+                run: String,
+                #[serde(default)]
+                wait: bool,
+            },
+        }
+
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum CommandConfigToml {
             Single(String),
-            Named(IndexMap<String, String>),
+            // Named must come before SingleExtended: a table like `{ run = "..." }`
+            // matches Named (command named "run") and should stay that way.
+            // SingleExtended only matches when Named fails (e.g., `wait = true` is
+            // a bool, not a valid CommandValue).
+            Named(IndexMap<String, CommandValue>),
+            SingleExtended {
+                run: String,
+                #[serde(default)]
+                wait: bool,
+            },
         }
 
         let toml = CommandConfigToml::deserialize(deserializer)?;
         let commands = match toml {
             CommandConfigToml::Single(cmd) => {
-                // Phase will be set later when commands are collected
                 vec![Command::new(None, cmd)]
+            }
+            CommandConfigToml::SingleExtended { run, wait } => {
+                vec![Command {
+                    name: None,
+                    expanded: run.clone(),
+                    template: run,
+                    wait,
+                }]
             }
             CommandConfigToml::Named(map) => {
                 // IndexMap preserves insertion order from TOML
@@ -103,7 +136,15 @@ impl<'de> Deserialize<'de> for CommandConfig {
                     }
                 }
                 map.into_iter()
-                    .map(|(name, template)| Command::new(Some(name), template))
+                    .map(|(name, value)| match value {
+                        CommandValue::Simple(template) => Command::new(Some(name), template),
+                        CommandValue::Extended { run, wait } => Command {
+                            name: Some(name),
+                            expanded: run.clone(),
+                            template: run,
+                            wait,
+                        },
+                    })
                     .collect()
             }
         };
@@ -118,12 +159,37 @@ impl JsonSchema for CommandConfig {
     }
 
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        // CommandConfig accepts either a string or an object with string values
-        // We just need this for schema generation, not validation
+        // CommandConfig accepts: a string, an extended object { run, wait? },
+        // or a named table where each value is a string or extended object.
         schemars::json_schema!({
             "oneOf": [
                 { "type": "string" },
-                { "type": "object", "additionalProperties": { "type": "string" } }
+                {
+                    "type": "object",
+                    "properties": {
+                        "run": { "type": "string" },
+                        "wait": { "type": "boolean", "default": false }
+                    },
+                    "required": ["run"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": {
+                        "oneOf": [
+                            { "type": "string" },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "run": { "type": "string" },
+                                    "wait": { "type": "boolean", "default": false }
+                                },
+                                "required": ["run"],
+                                "additionalProperties": false
+                            }
+                        ]
+                    }
+                }
             ]
         })
     }
@@ -135,8 +201,8 @@ impl Serialize for CommandConfig {
     where
         S: serde::Serializer,
     {
-        // If single unnamed command, serialize as string
-        if self.commands.len() == 1 && self.commands[0].name.is_none() {
+        // If single unnamed command without wait, serialize as string
+        if self.commands.len() == 1 && self.commands[0].name.is_none() && !self.commands[0].wait {
             return self.commands[0].template.serialize(serializer);
         }
 
@@ -153,7 +219,23 @@ impl Serialize for CommandConfig {
                     format!("_{unnamed_counter}")
                 }
             };
-            map.serialize_entry(&key, &cmd.template)?;
+            if cmd.wait {
+                // Emit extended form: { run = "...", wait = true }
+                #[derive(Serialize)]
+                struct Extended<'a> {
+                    run: &'a str,
+                    wait: bool,
+                }
+                map.serialize_entry(
+                    &key,
+                    &Extended {
+                        run: &cmd.template,
+                        wait: true,
+                    },
+                )?;
+            } else {
+                map.serialize_entry(&key, &cmd.template)?;
+            }
         }
         map.end()
     }
@@ -448,5 +530,201 @@ third = "echo 3"
         _1 = "npm install"
         setup = "echo setup"
         "#);
+    }
+
+    // ============================================================================
+    // Wait Flag Tests
+    // ============================================================================
+
+    #[test]
+    fn test_deserialize_extended_with_wait() {
+        let toml_str = r#"
+[command]
+install = { run = "npm install", wait = true }
+build = "npm run build"
+"#;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            command: CommandConfig,
+        }
+
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        let commands = wrapper.command.commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].name.as_deref(), Some("install"));
+        assert_eq!(commands[0].template, "npm install");
+        assert!(commands[0].wait);
+        assert_eq!(commands[1].name.as_deref(), Some("build"));
+        assert_eq!(commands[1].template, "npm run build");
+        assert!(!commands[1].wait);
+    }
+
+    #[test]
+    fn test_deserialize_extended_wait_defaults_false() {
+        let toml_str = r#"
+[command]
+install = { run = "npm install" }
+"#;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            command: CommandConfig,
+        }
+
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        let commands = wrapper.command.commands();
+        assert_eq!(commands[0].template, "npm install");
+        assert!(!commands[0].wait);
+    }
+
+    #[test]
+    fn test_deserialize_single_string_no_wait() {
+        let toml_str = r#"command = "npm install""#;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            command: CommandConfig,
+        }
+
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!(!wrapper.command.commands()[0].wait);
+    }
+
+    #[test]
+    fn test_deserialize_command_named_run() {
+        // A command named "run" must not be confused with the extended form
+        let toml_str = r#"
+[command]
+run = "npm install"
+"#;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            command: CommandConfig,
+        }
+
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        let commands = wrapper.command.commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name.as_deref(), Some("run"));
+        assert_eq!(commands[0].template, "npm install");
+        assert!(!commands[0].wait);
+    }
+
+    #[test]
+    fn test_deserialize_single_extended() {
+        // `post-start = { run = "...", wait = true }` — unnamed command with wait
+        let toml_str = r#"command = { run = "npm install", wait = true }"#;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            command: CommandConfig,
+        }
+
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        let commands = wrapper.command.commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, None);
+        assert_eq!(commands[0].template, "npm install");
+        assert!(commands[0].wait);
+    }
+
+    #[test]
+    fn test_deserialize_single_extended_without_wait() {
+        // `{ run = "..." }` without wait parses as Named (command named "run")
+        let toml_str = r#"command = { run = "npm install" }"#;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            command: CommandConfig,
+        }
+
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        let commands = wrapper.command.commands();
+        assert_eq!(commands.len(), 1);
+        // Without `wait = true`, this matches Named (command named "run")
+        assert_eq!(commands[0].name.as_deref(), Some("run"));
+        assert_eq!(commands[0].template, "npm install");
+    }
+
+    #[test]
+    fn test_serialize_wait_command() {
+        #[derive(Serialize)]
+        struct Wrapper {
+            cmd: CommandConfig,
+        }
+
+        let mut install = Command::new(Some("install".to_string()), "npm install".to_string());
+        install.wait = true;
+
+        let wrapper = Wrapper {
+            cmd: CommandConfig {
+                commands: vec![
+                    install,
+                    Command::new(Some("build".to_string()), "npm run build".to_string()),
+                ],
+            },
+        };
+
+        // TOML puts simple key-value pairs before sub-table headers
+        assert_snapshot!(toml::to_string(&wrapper).unwrap(), @r#"
+        [cmd]
+        build = "npm run build"
+
+        [cmd.install]
+        run = "npm install"
+        wait = true
+        "#);
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_wait() {
+        let toml_str = r#"
+[cmd]
+install = { run = "npm install", wait = true }
+build = "npm run build"
+"#;
+
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            cmd: CommandConfig,
+        }
+
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        let commands = wrapper.cmd.commands();
+        assert!(commands[0].wait);
+        assert!(!commands[1].wait);
+
+        // Roundtrip preserves wait flag and templates (order may change due to
+        // TOML sub-table serialization rules)
+        let reserialized = toml::to_string(&wrapper).unwrap();
+        let roundtrip: Wrapper = toml::from_str(&reserialized).unwrap();
+        let cmds = roundtrip.cmd.commands();
+        let wait_cmd = cmds.iter().find(|c| c.wait).expect("should have wait cmd");
+        assert_eq!(wait_cmd.template, "npm install");
+        let bg_cmd = cmds.iter().find(|c| !c.wait).expect("should have bg cmd");
+        assert_eq!(bg_cmd.template, "npm run build");
+    }
+
+    #[test]
+    fn test_merge_preserves_wait() {
+        let mut install = Command::new(Some("install".to_string()), "npm install".to_string());
+        install.wait = true;
+
+        let base = CommandConfig {
+            commands: vec![install],
+        };
+        let overlay = CommandConfig {
+            commands: vec![Command::new(
+                Some("build".to_string()),
+                "npm run build".to_string(),
+            )],
+        };
+
+        let merged = base.merge_append(&overlay);
+        assert_eq!(merged.commands.len(), 2);
+        assert!(merged.commands[0].wait);
+        assert!(!merged.commands[1].wait);
     }
 }

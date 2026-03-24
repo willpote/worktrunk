@@ -159,11 +159,15 @@ fn filter_by_name(
 /// Spawn hook commands as background (detached) processes.
 ///
 /// Used for post-start and post-switch hooks during normal worktree operations.
-/// Commands are spawned and immediately detached - we don't wait for them.
 ///
-/// By default, shows a single-line summary of all hooks being run, with support
+/// Commands with `wait = true` run serially and blocking before any concurrent
+/// commands are spawned. If a wait command fails, remaining wait and concurrent
+/// commands are skipped.
+///
+/// By default, shows a single-line summary of concurrent hooks being run, with support
 /// for multiple hook types in a single message (e.g., "Running post-switch: user:foo; post-start: project:bar").
-/// With `-v`, shows verbose per-hook output with command details.
+/// Wait commands get individual announcements (like pre-* hooks).
+/// With `-v`, shows verbose per-hook output with command details for all commands.
 pub fn spawn_background_hooks(
     ctx: &CommandContext,
     commands: Vec<SourcedCommand>,
@@ -172,13 +176,56 @@ pub fn spawn_background_hooks(
         return Ok(());
     }
 
+    let (wait_commands, concurrent_commands): (Vec<_>, Vec<_>) =
+        commands.into_iter().partition(|cmd| cmd.prepared.wait);
+
+    // Phase 1: Run wait commands serially (blocking, visible output).
+    // Track which hook types had failures so we skip their concurrent commands
+    // but don't suppress unrelated hook types.
+    let mut failed_types: Vec<HookType> = Vec::new();
+    for cmd in &wait_commands {
+        if failed_types.contains(&cmd.hook_type) {
+            continue;
+        }
+        cmd.announce()?;
+
+        let log_label = format!("{} {}", cmd.hook_type, cmd.summary_name());
+        if let Err(err) = execute_command_in_worktree(
+            ctx.worktree_path,
+            &cmd.prepared.expanded,
+            Some(&cmd.prepared.context_json),
+            Some(&log_label),
+        ) {
+            let err_msg = err.to_string();
+            let message = match &cmd.prepared.name {
+                Some(name) => cformat!("Command <bold>{name}</> failed: {err_msg}"),
+                None => format!("Command failed: {err_msg}"),
+            };
+            eprintln!("{}", warning_message(message));
+            failed_types.push(cmd.hook_type);
+        }
+    }
+
+    // Phase 2: Spawn concurrent commands in background (detached),
+    // skipping hook types whose wait commands failed.
+    let concurrent_commands: Vec<_> = concurrent_commands
+        .into_iter()
+        .filter(|cmd| !failed_types.contains(&cmd.hook_type))
+        .collect();
+
+    if concurrent_commands.is_empty() {
+        return Ok(());
+    }
+
     let verbose = verbosity();
 
     if verbose == 0 {
         // Group commands by hook type, preserving insertion order
-        let groups = group_commands_by_hook_type(&commands);
+        let groups = group_commands_by_hook_type(&concurrent_commands);
         // All commands in a batch share the same display_path (set by prepare_hook_commands)
-        let display_path = commands.first().and_then(|c| c.display_path.as_ref());
+        let display_path = concurrent_commands
+            .first()
+            .and_then(|c| c.display_path.as_ref());
 
         // Format: "Running {type}: {names}[; {type}: {names}]... [@ {path}]"
         let type_segments: Vec<String> = groups
@@ -209,7 +256,7 @@ pub fn spawn_background_hooks(
     // Use a Vec since HookType doesn't implement Hash
     let mut unnamed_indices: Vec<(HookType, usize)> = Vec::new();
 
-    for cmd in &commands {
+    for cmd in &concurrent_commands {
         if verbose >= 1 {
             cmd.announce()?;
         }

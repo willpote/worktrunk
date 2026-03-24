@@ -13,6 +13,8 @@ pub struct PreparedCommand {
     pub name: Option<String>,
     pub expanded: String,
     pub context_json: String,
+    /// When true, this command blocks before concurrent commands are spawned.
+    pub wait: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -196,10 +198,13 @@ fn expand_commands(
         let context_json = serde_json::to_string(&cmd_context)
             .expect("HashMap<String, String> serialization should never fail");
 
-        result.push((
-            Command::with_expansion(cmd.name.clone(), cmd.template.clone(), expanded_str),
-            context_json,
-        ));
+        let expanded_cmd = Command {
+            name: cmd.name.clone(),
+            template: cmd.template.clone(),
+            expanded: expanded_str,
+            wait: cmd.wait,
+        };
+        result.push((expanded_cmd, context_json));
     }
 
     Ok(result)
@@ -233,6 +238,7 @@ pub fn prepare_commands(
             name: cmd.name,
             expanded: cmd.expanded,
             context_json,
+            wait: cmd.wait,
         })
         .collect())
 }

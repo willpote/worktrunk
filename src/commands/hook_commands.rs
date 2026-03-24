@@ -602,12 +602,20 @@ fn render_hook_commands(
             false
         };
 
+        // Show (wait) only for post-* hooks where it's meaningful
+        let wait_suffix = if cmd.wait && hook_type.to_string().starts_with("post-") {
+            cformat!(" <dim>(wait)</>")
+        } else {
+            String::new()
+        };
+
         // Use ❯ for needs approval, ○ for approved/user hooks
-        let (emoji, suffix) = if needs_approval {
+        let (emoji, approval_suffix) = if needs_approval {
             (PROMPT_SYMBOL, cformat!(" <dim>(requires approval)</>"))
         } else {
             (INFO_SYMBOL, String::new())
         };
+        let suffix = format!("{wait_suffix}{approval_suffix}");
 
         writeln!(out, "{emoji} {label}{suffix}")?;
 

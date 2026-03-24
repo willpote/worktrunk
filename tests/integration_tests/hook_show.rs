@@ -450,6 +450,36 @@ optional-var = "echo {{ base }}"
     });
 }
 
+/// Test that `wait` flag is displayed in hook show output.
+#[rstest]
+fn test_hook_show_wait_flag(repo: TestRepo, temp_home: TempDir) {
+    let config_path = temp_home.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"worktree-path = "../{{ repo }}.{{ branch }}"
+
+[post-start]
+install = { run = "npm install", wait = true }
+build = "npm run build"
+"#,
+    )
+    .unwrap();
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.arg("hook")
+            .arg("show")
+            .arg("post-start")
+            .current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+        cmd.env("WORKTRUNK_CONFIG_PATH", &config_path);
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
 /// Test that valid templates expand correctly with --expanded.
 #[rstest]
 fn test_hook_show_expanded_valid_template(repo: TestRepo, temp_home: TempDir) {
