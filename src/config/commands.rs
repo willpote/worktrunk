@@ -32,7 +32,6 @@ impl Command {
             wait: false,
         }
     }
-
 }
 
 /// Configuration for commands - canonical representation
