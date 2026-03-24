@@ -453,7 +453,8 @@ optional-var = "echo {{ base }}"
 /// Test that `wait` flag is displayed in hook show output.
 #[rstest]
 fn test_hook_show_wait_flag(repo: TestRepo, temp_home: TempDir) {
-    let config_path = temp_home.path().join("config.toml");
+    // Write config inside the repo so paths use the _REPO_ placeholder consistently
+    let config_path = repo.root_path().join("test-config.toml");
     fs::write(
         &config_path,
         r#"worktree-path = "../{{ repo }}.{{ branch }}"

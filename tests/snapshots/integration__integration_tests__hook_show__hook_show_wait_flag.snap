@@ -43,7 +43,7 @@ exit_code: 0
 ----- stdout -----
 
 ----- stderr -----
-[36mUSER HOOKS[39m @ [TEMP_HOME]/config.toml
+[36mUSER HOOKS[39m @ _REPO_/test-config.toml
 [2m○[22m post-start [1minstall[22m: [2m(wait)[22m
 [107m [0m [2m[0m[2m[34mnpm[0m[2m install
 [2m○[22m post-start [1mbuild[22m:

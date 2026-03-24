@@ -33,15 +33,6 @@ impl Command {
         }
     }
 
-    /// Create a command with both template and expanded forms
-    pub fn with_expansion(name: Option<String>, template: String, expanded: String) -> Self {
-        Self {
-            name,
-            template,
-            expanded,
-            wait: false,
-        }
-    }
 }
 
 /// Configuration for commands - canonical representation
